@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Voxel Sandbox - Phase 1</title>
+<title>Voxel Sandbox - Cube Terrain</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; user-select:none; }
   html, body { width:100%; height:100%; overflow:hidden; background:#87CEEB; font-family:sans-serif; }
   canvas { display:block; width:100%; height:100%; }
   #ui { position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; }
-  #startScreen { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:rgba(0,0,0,0.75); color:#fff; padding:2.5rem; border-radius:12px; text-align:center; pointer-events:auto; z-index:10; min-width:320px; }
+  #startScreen { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:rgba(0,0,0,0.75); color:#fff; padding:2.5rem; border-radius:12px; text-align:center; pointer-events:auto; z-index:10; min-width:340px; }
   #startScreen h1 { margin-bottom:1rem; font-size:1.6rem; }
   #seedInput { padding:0.5rem; width:100%; margin:1rem 0; border-radius:6px; border:none; font-size:1rem; }
   #startBtn { padding:0.75rem 2rem; font-size:1.1rem; background:#4CAF50; color:#fff; border:none; border-radius:6px; cursor:pointer; transition:background 0.2s; }
@@ -44,81 +44,128 @@
 <script>
 'use strict';
 
-// ========== ユーティリティ ==========
+// ========== 定数 ==========
+const BLOCK_SIZE = 1;
+const CHUNK_SIZE = 16;
+const CHUNK_HEIGHT = 48;
+const BASE_LEVEL = 12;
+const RENDER_DISTANCE = 3;
+
+const GRAVITY = 22;
+const JUMP_FORCE = 8.0;
+const WALK_SPEED = 5.0;
+const SNEAK_SPEED = 2.5;
+const PLAYER_HEIGHT = 1.7;
+const PLAYER_WIDTH = 0.6;
+const PLAYER_EYE = 1.5;
+
+// ブロック種別
+const BLOCK = {
+  AIR:0,
+  GRASS:1,
+  DIRT:2,
+  STONE:3,
+  SAND:4,
+  WATER:5,
+  BEDROCK:6,
+  WOOD:7,
+  LEAVES:8
+};
+
+const BLOCK_INFO = {
+  [BLOCK.GRASS]:  { color:'#4CAF50', solid:true },
+  [BLOCK.DIRT]:   { color:'#8D6E63', solid:true },
+  [BLOCK.STONE]:  { color:'#90A4AE', solid:true },
+  [BLOCK.SAND]:   { color:'#FDD835', solid:true },
+  [BLOCK.WATER]:  { color:'#2196F3', solid:false, alpha:0.7 },
+  [BLOCK.BEDROCK]:{ color:'#212121', solid:true },
+  [BLOCK.WOOD]:   { color:'#8D4E2A', solid:true },
+  [BLOCK.LEAVES]: { color:'#388E3C', solid:true, alpha:0.8 }
+};
+
+// 6方向：±X, ±Y, ±Z
+const DIR = [
+  [1,0,0], [-1,0,0],
+  [0,1,0], [0,-1,0],
+  [0,0,1], [0,0,-1]
+];
+
+// 各面の頂点（基準位置からの相対座標）
+const FACE_VERTS = [
+  // +X
+  [[0.5,-0.5,-0.5],[0.5, 0.5,-0.5],[0.5, 0.5, 0.5],
+   [0.5,-0.5, 0.5],[0.5,-0.5,-0.5],[0.5, 0.5, 0.5]],
+  // -X
+  [[-0.5,-0.5, 0.5],[-0.5, 0.5, 0.5],[-0.5, 0.5,-0.5],
+   [-0.5,-0.5,-0.5],[-0.5,-0.5, 0.5],[-0.5, 0.5,-0.5]],
+  // +Y
+  [[-0.5, 0.5,-0.5],[-0.5, 0.5, 0.5],[ 0.5, 0.5, 0.5],
+   [ 0.5, 0.5,-0.5],[-0.5, 0.5,-0.5],[ 0.5, 0.5, 0.5]],
+  // -Y
+  [[-0.5,-0.5, 0.5],[-0.5,-0.5,-0.5],[ 0.5,-0.5,-0.5],
+   [ 0.5,-0.5, 0.5],[-0.5,-0.5, 0.5],[ 0.5,-0.5,-0.5]],
+  // +Z
+  [[ 0.5,-0.5, 0.5],[ 0.5, 0.5, 0.5],[-0.5, 0.5, 0.5],
+   [-0.5,-0.5, 0.5],[ 0.5,-0.5, 0.5],[-0.5, 0.5, 0.5]],
+  // -Z
+  [[-0.5,-0.5,-0.5],[-0.5, 0.5,-0.5],[ 0.5, 0.5,-0.5],
+   [ 0.5,-0.5,-0.5],[-0.5,-0.5,-0.5],[ 0.5, 0.5,-0.5]]
+];
+
+// ========== ノイズ生成 ==========
 class SeededRandom {
-  constructor(seed) { this.seed = seed; }
+  constructor(seed) { this.seed = seed >>> 0; }
   next() {
-    this.seed = (this.seed * 1103515245 + 12345) & 0x7fffffff;
-    return this.seed / 0x80000000;
+    this.seed = (this.seed * 1664525 + 1013904223) >>> 0;
+    return (this.seed & 0xFFFFFF) / 0x1000000;
   }
 }
 
-class Noise {
+class Simplex2D {
   constructor(seed) {
-    this.rng = new SeededRandom(seed);
+    const rng = new SeededRandom(seed);
     this.perm = Array.from({length:256}, (_,i)=>i);
     for(let i=255; i>0; i--) {
-      const j = Math.floor(this.rng.next()*(i+1));
+      const j = Math.floor(rng.next()*(i+1));
       [this.perm[i],this.perm[j]] = [this.perm[j],this.perm[i]];
     }
     this.perm = [...this.perm, ...this.perm];
   }
-  fade(t) { return t*t*t*(t*(t*6-15)+10); }
-  lerp(a,b,t) { return a + t*(b-a); }
-  grad(hash, x, y) {
-    const h = hash & 3;
-    const u = h<2 ? x : y, v = h<2 ? y : x;
-    return ((h&1)?-1:1)*u + ((h&2)?-1:1)*v;
-  }
-  noise2D(x, y) {
-    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
-    x -= Math.floor(x); y -= Math.floor(y);
-    const u = this.fade(x), v = this.fade(y);
-    const A = this.perm[X]+Y, B = this.perm[X+1]+Y;
+
+  noise(x,y) {
+    const X = Math.floor(x) & 255;
+    const Y = Math.floor(y) & 255;
+    x -= Math.floor(x);
+    y -= Math.floor(y);
+    const u = this.fade(x);
+    const v = this.fade(y);
+    const A = this.perm[X] + Y;
+    const B = this.perm[X+1] + Y;
     return this.lerp(
       this.lerp(this.grad(this.perm[A], x, y), this.grad(this.perm[B], x-1, y), u),
       this.lerp(this.grad(this.perm[A+1], x, y-1), this.grad(this.perm[B+1], x-1, y-1), u),
       v
     );
   }
-  fbm(x,y,octs=4) {
-    let v=0, a=0.5, f=1;
-    for(let i=0;i<octs;i++) {
-      v += a*this.noise2D(x*f, y*f);
-      f *=2; a *=0.5;
+
+  fade(t) { return t*t*t*(t*(t*6-15)+10); }
+  lerp(a,b,t) { return a + t*(b-a); }
+  grad(h,x,y) {
+    const hh = h & 3;
+    return ((hh&1)?x:-x) + ((hh&2)?y:-y);
+  }
+
+  fbm(x,y,octaves=4) {
+    let sum=0, amp=1, freq=1, max=0;
+    for(let i=0;i<octaves;i++) {
+      sum += amp * this.noise(x*freq, y*freq);
+      max += amp;
+      amp *= 0.5;
+      freq *= 2;
     }
-    return v;
+    return sum / max;
   }
 }
-
-// ========== 定数 ==========
-const BLOCK_SIZE = 1;
-const CHUNK_SIZE = 16;
-const RENDER_DISTANCE = 3;
-const GRAVITY = 18;
-const JUMP_FORCE = 7.2;
-const WALK_SPEED = 5.0;
-const RUN_SPEED = 7.0;
-const SNEAK_SPEED = 2.5;
-const PLAYER_HEIGHT = 1.8;
-const PLAYER_WIDTH = 0.6;
-
-const BLOCK_TYPES = {
-  AIR:0,
-  GRASS:1, DIRT:2, STONE:3, SAND:4, WATER:5,
-  WOOD:6, LEAVES:7, BEDROCK:8
-};
-
-const BLOCK_COLORS = {
-  [BLOCK_TYPES.GRASS]: '#4CAF50',
-  [BLOCK_TYPES.DIRT]: '#8D6E63',
-  [BLOCK_TYPES.STONE]: '#9E9E9E',
-  [BLOCK_TYPES.SAND]: '#FDD835',
-  [BLOCK_TYPES.WATER]: 'rgba(33,150,243,0.7)',
-  [BLOCK_TYPES.WOOD]: '#8D4E2A',
-  [BLOCK_TYPES.LEAVES]: '#2E7D32',
-  [BLOCK_TYPES.BEDROCK]: '#424242'
-};
 
 // ========== ゲーム状態 ==========
 let scene, camera, renderer, noise;
@@ -126,171 +173,124 @@ let player = {
   x:0, y:20, z:0,
   vx:0, vy:0, vz:0,
   yaw:0, pitch:0,
-  onGround:false, sneaking:false,
-  width:PLAYER_WIDTH, height:PLAYER_HEIGHT
+  onGround:false
 };
 let keys = {};
 let chunks = new Map();
-let lastTime = performance.now(), frameCount=0, fps=0;
+let lastTime = performance.now(), fpsCount=0, fps=0;
 let isPlaying = false;
 
-// ========== 初期化 ==========
-function init(seedValue) {
-  const seed = parseInt(seedValue) || Date.now();
-  noise = new Noise(seed);
-
-  scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x87CEEB);
-  scene.fog = new THREE.Fog(0x87CEEB, 10, CHUNK_SIZE*RENDER_DISTANCE*1.2);
-
-  camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 200);
-  camera.rotation.order = 'YXZ';
-
-  renderer = new THREE.WebGLRenderer({antialias:false});
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.2)); // 低スペック対応
-  document.body.appendChild(renderer.domElement);
-
-  // 照明
-  const sun = new THREE.DirectionalLight(0xffffee, 1.2);
-  sun.position.set(50, 100, 50);
-  scene.add(sun);
-  scene.add(new THREE.AmbientLight(0x90a0c0, 0.5));
-
-  // プレイヤー初期位置：最初の地形に合わせる
-  const startHeight = getHeight(0,0) + 3;
-  player.y = startHeight;
-
-  // ホットバー描画
-  updateHotbarUI();
-
-  // イベント
-  window.addEventListener('resize', onResize);
-  document.addEventListener('keydown', onKeyDown);
-  document.addEventListener('keyup', onKeyUp);
-  document.addEventListener('mousemove', onMouseMove);
-  document.addEventListener('pointerlockchange', onLockChange);
-
-  requestAnimationFrame(loop);
+// ========== 地形生成：立方体ブロック単位 ==========
+function getHeightValue(wx, wz) {
+  // 大まかな高低
+  const large = noise.fbm(wx*0.02, wz*0.02, 4) * 8;
+  // 細かい起伏
+  const small = noise.fbm(wx*0.1, wz*0.1, 2) * 2;
+  return Math.floor(BASE_LEVEL + large + small);
 }
 
-// ========== 地形生成 ==========
-function getHeight(x,z) {
-  const h1 = noise.fbm(x*0.05, z*0.05, 4) * 6;
-  const h2 = noise.fbm(x*0.2, z*0.2, 2) * 2;
-  const base = 10;
-  return base + h1 + h2;
+function getBlockAt(wx, wy, wz) {
+  if(wy < 0) return BLOCK.BEDROCK;
+  const surfaceY = getHeightValue(wx, wz);
+
+  // 地下
+  if(wy < surfaceY - 3) return BLOCK.STONE;
+  if(wy < surfaceY - 1) return BLOCK.DIRT;
+  if(wy === surfaceY && wy < 8) return BLOCK.SAND; // 水辺は砂
+  if(wy === surfaceY) return BLOCK.GRASS;
+  if(wy < 8 && wy > surfaceY) return BLOCK.WATER;
+
+  return BLOCK.AIR;
 }
 
-function getBlock(x,y,z) {
-  if(y < -6) return BLOCK_TYPES.BEDROCK;
-  const h = getHeight(x,z);
-  const distToWater = h - 8;
-  if(y > h + 5) return BLOCK_TYPES.AIR;
-  if(y <= h && y > h - 1) {
-    return h < 8 ? BLOCK_TYPES.SAND : BLOCK_TYPES.GRASS;
-  }
-  if(y <= h - 1 && y > h - 3) return BLOCK_TYPES.DIRT;
-  if(y <= h - 3 && y > -6) return BLOCK_TYPES.STONE;
-  if(y <= 8 && y > h) return BLOCK_TYPES.WATER;
-  return BLOCK_TYPES.AIR;
+function isBlockSolid(wx, wy, wz) {
+  const id = getBlockAt(wx, wy, wz);
+  return id !== BLOCK.AIR && id !== BLOCK.WATER;
 }
 
-// ========== チャンク ==========
+// ========== チャンク管理 ==========
 function chunkKey(cx,cz) { return `${cx},${cz}`; }
-function worldToChunk(x,z) {
-  return {
-    cx: Math.floor(x/CHUNK_SIZE),
-    cz: Math.floor(z/CHUNK_SIZE),
-    bx: ((x%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE,
-    bz: ((z%CHUNK_SIZE)+CHUNK_SIZE)%CHUNK_SIZE
-  };
+function worldToChunk(wx, wz) {
+  const cx = Math.floor(wx / CHUNK_SIZE);
+  const cz = Math.floor(wz / CHUNK_SIZE);
+  const bx = ((wx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+  const bz = ((wz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+  return {cx, cz, bx, bz};
 }
 
-function buildChunk(cx,cz) {
-  const key = chunkKey(cx,cz);
-  if(chunks.has(key)) return;
-
-  const geometry = new THREE.BufferGeometry();
-  const positions = [], colors = [];
-  const ox = cx*CHUNK_SIZE, oz = cz*CHUNK_SIZE;
+function buildChunkMesh(cx, cz) {
+  const ox = cx * CHUNK_SIZE;
+  const oz = cz * CHUNK_SIZE;
+  const positions = [];
+  const colors = [];
 
   for(let bx=0; bx<CHUNK_SIZE; bx++) {
-    for(let bz=0; bz<CHUNK_SIZE; bz++) {
-      for(let by=-5; by<32; by++) {
-        const x = ox+bx, y=by, z=oz+bz;
-        const id = getBlock(x,y,z);
-        if(id === BLOCK_TYPES.AIR) continue;
-        const col = new THREE.Color(BLOCK_COLORS[id]);
+    for(let by=0; by<CHUNK_HEIGHT; by++) {
+      for(let bz=0; bz<CHUNK_SIZE; bz++) {
+        const wx = ox + bx;
+        const wy = by;
+        const wz = oz + bz;
+        const id = getBlockAt(wx, wy, wz);
+        if(id === BLOCK.AIR) continue;
 
-        // 簡易的な可視面判定
-        const neighbors = [
-          [1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]
-        ];
-        for(const [dx,dy,dz] of neighbors) {
-          const nid = getBlock(x+dx, y+dy, z+dz);
-          if(nid === BLOCK_TYPES.AIR || nid === BLOCK_TYPES.WATER || id === BLOCK_TYPES.WATER) {
-            addFace(positions, colors, bx,by,bz, dx,dy,dz, col);
+        const info = BLOCK_INFO[id];
+        const col = new THREE.Color(info.color);
+
+        // 隣が空気または不透過でない場合に面を描画
+        for(let dir=0; dir<6; dir++) {
+          const [dx, dy, dz] = DIR[dir];
+          const nid = getBlockAt(wx+dx, wy+dy, wz+dz);
+          const ninfo = BLOCK_INFO[nid];
+          const needFace = !ninfo || !ninfo.solid;
+          if(!needFace) continue;
+
+          // この面の6頂点を追加
+          for(const [vx, vy, vz] of FACE_VERTS[dir]) {
+            positions.push(bx+vx, by+vy, bz+vz);
+            colors.push(col.r, col.g, col.b);
           }
         }
       }
     }
   }
 
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
-  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors,3));
-  geometry.computeBoundingSphere();
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geom.computeBoundingSphere();
 
-  const mat = new THREE.MeshLambertMaterial({vertexColors:true, side:THREE.DoubleSide, transparent:true, alphaTest:0.01});
-  const mesh = new THREE.Mesh(geometry, mat);
+  const mat = new THREE.MeshLambertMaterial({
+    vertexColors: true,
+    side: THREE.DoubleSide,
+    transparent: true,
+    alphaTest: 0.05
+  });
+  const mesh = new THREE.Mesh(geom, mat);
   mesh.position.set(ox, 0, oz);
-  scene.add(mesh);
-  chunks.set(key, mesh);
-}
-
-function addFace(pos, col, x,y,z, dx,dy,dz, c) {
-  const s = 0.5;
-  let verts;
-  if(dx !== 0) {
-    const nx = x + (dx>0?1:0);
-    verts = [
-      nx-s, y-s, z-s, nx-s, y+s, z-s, nx-s, y+s, z+s,
-      nx-s, y-s, z+s, nx-s, y-s, z-s, nx-s, y+s, z+s
-    ];
-  } else if(dy !== 0) {
-    const ny = y + (dy>0?1:0);
-    verts = [
-      x-s, ny-s, z+s, x+s, ny-s, z+s, x+s, ny-s, z-s,
-      x-s, ny-s, z-s, x-s, ny-s, z+s, x+s, ny-s, z-s
-    ];
-  } else {
-    const nz = z + (dz>0?1:0);
-    verts = [
-      x+s, y-s, nz-s, x+s, y+s, nz-s, x-s, y+s, nz-s,
-      x-s, y-s, nz-s, x+s, y-s, nz-s, x+s, y+s, nz-s
-    ];
-  }
-  pos.push(...verts);
-  for(let i=0;i<6;i++) col.push(c.r,c.g,c.b);
+  return mesh;
 }
 
 function updateChunks() {
-  const pcx = Math.floor(player.x/CHUNK_SIZE);
-  const pcz = Math.floor(player.z/CHUNK_SIZE);
-  const needed = new Set();
+  const pcx = Math.floor(player.x / CHUNK_SIZE);
+  const pcz = Math.floor(player.z / CHUNK_SIZE);
+  const active = new Set();
 
   for(let dx=-RENDER_DISTANCE; dx<=RENDER_DISTANCE; dx++) {
     for(let dz=-RENDER_DISTANCE; dz<=RENDER_DISTANCE; dz++) {
-      if(Math.hypot(dx,dz) > RENDER_DISTANCE) continue;
-      const cx = pcx+dx, cz = pcz+dz;
-      needed.add(chunkKey(cx,cz));
-      buildChunk(cx,cz);
+      if(Math.hypot(dx, dz) > RENDER_DISTANCE) continue;
+      const key = chunkKey(pcx+dx, pcz+dz);
+      active.add(key);
+      if(!chunks.has(key)) {
+        const mesh = buildChunkMesh(pcx+dx, pcz+dz);
+        scene.add(mesh);
+        chunks.set(key, mesh);
+      }
     }
   }
 
-  // 不要チャンク削除
-  for(const [key,mesh] of chunks) {
-    if(!needed.has(key)) {
+  // 範囲外のチャンク削除
+  for(const [key, mesh] of chunks) {
+    if(!active.has(key)) {
       scene.remove(mesh);
       mesh.geometry.dispose();
       mesh.material.dispose();
@@ -299,40 +299,47 @@ function updateChunks() {
   }
 }
 
-// ========== 移動・衝突 ==========
-function resolveCollision(px,py,pz, pw, ph) {
-  const step = 0.25;
-  let yGround = -1000;
+// ========== 衝突判定 ==========
+function checkCollision(px, py, pz) {
+  const r = PLAYER_WIDTH / 2 + 0.05;
+  const margin = 0.001;
+  // 確認するブロック範囲
+  const minX = Math.floor(px - r);
+  const maxX = Math.floor(px + r);
+  const minY = Math.floor(py);
+  const maxY = Math.floor(py + PLAYER_HEIGHT - margin);
+  const minZ = Math.floor(pz - r);
+  const maxZ = Math.floor(pz + r);
 
-  // 簡易的な地面判定
-  for(let ox=-pw/2; ox<=pw/2; ox+=step) {
-    for(let oz=-pw/2; oz<=pw/2; oz+=step) {
-      const h = getHeight(px+ox, pz+oz);
-      if(h > yGround) yGround = h;
+  for(let bx=minX; bx<=maxX; bx++) {
+    for(let by=minY; by<=maxY; by++) {
+      for(let bz=minZ; bz<=maxZ; bz++) {
+        if(isBlockSolid(bx, by, bz)) {
+          return true;
+        }
+      }
     }
   }
-
-  const groundLevel = yGround;
-  const onGround = py <= groundLevel + 0.05;
-  return { groundLevel, onGround };
+  return false;
 }
 
+// ========== 物理演算 ==========
 function updatePhysics(dt) {
-  // 速度更新
-  const speed = keys['ShiftLeft'] ? SNEAK_SPEED : (keys['KeyW']&&(keys['ShiftLeft']?false:true)) ? RUN_SPEED : WALK_SPEED;
+  // 移動方向
   let dx=0, dz=0;
   if(keys['KeyW']) dz -= 1;
   if(keys['KeyS']) dz += 1;
   if(keys['KeyA']) dx -= 1;
   if(keys['KeyD']) dx += 1;
 
-  if(dx!==0 || dz!==0) {
-    const len = Math.hypot(dx,dz);
+  const speed = keys['ShiftLeft'] ? SNEAK_SPEED : WALK_SPEED;
+  if(dx || dz) {
+    const len = Math.hypot(dx, dz);
     dx /= len; dz /= len;
     const sy = Math.sin(player.yaw);
     const cy = Math.cos(player.yaw);
-    player.vx = (dx*cy - dz*sy) * speed;
-    player.vz = (dz*cy + dx*sy) * speed;
+    player.vx = (dx * cy - dz * sy) * speed;
+    player.vz = (dz * cy + dx * sy) * speed;
   } else {
     player.vx *= 0.8;
     player.vz *= 0.8;
@@ -341,53 +348,72 @@ function updatePhysics(dt) {
   // 重力
   player.vy -= GRAVITY * dt;
 
-  // 位置更新
-  const newX = player.x + player.vx * dt;
-  const newY = player.y + player.vy * dt;
-  const newZ = player.z + player.vz * dt;
-
-  // 接地判定
-  const {groundLevel, onGround} = resolveCollision(newX, newY, newZ, player.width, player.height);
-  player.onGround = onGround;
-
-  if(newY <= groundLevel + 0.01) {
-    player.y = groundLevel + 0.01;
-    player.vy = 0;
+  // X軸方向の移動と衝突
+  let nx = player.x + player.vx * dt;
+  if(!checkCollision(nx, player.y, player.z)) {
+    player.x = nx;
   } else {
-    player.y = newY;
+    player.vx = 0;
   }
-  player.x = newX;
-  player.z = newZ;
 
-  // 落下保護
+  // Z軸
+  let nz = player.z + player.vz * dt;
+  if(!checkCollision(player.x, player.y, nz)) {
+    player.z = nz;
+  } else {
+    player.vz = 0;
+  }
+
+  // Y軸（上下）
+  let ny = player.y + player.vy * dt;
+  player.onGround = false;
+  if(!checkCollision(player.x, ny, player.z)) {
+    player.y = ny;
+  } else {
+    if(player.vy < 0) {
+      // 着地
+      player.onGround = true;
+      // 地面に合わせてY位置を補正
+      while(player.y > 0 && !checkCollision(player.x, player.y - 0.05, player.z)) {
+        player.y -= 0.05;
+      }
+    }
+    player.vy = 0;
+  }
+
+  // 落下しすぎたらリスポーン
   if(player.y < -10) {
-    player.y = getHeight(player.x, player.z) + 5;
+    player.y = getHeightValue(Math.floor(player.x), Math.floor(player.z)) + 5;
     player.vy = 0;
   }
 
   // カメラ位置
-  camera.position.set(player.x, player.y + PLAYER_HEIGHT*0.9, player.z);
+  camera.position.set(player.x, player.y + PLAYER_EYE, player.z);
+  camera.rotation.set(player.pitch, player.yaw, 0);
 }
 
-// ========== 入力 ==========
+// ========== 入力処理 ==========
 function onKeyDown(e) {
   keys[e.code] = true;
   if(e.code === 'Space' && player.onGround && isPlaying) {
     player.vy = JUMP_FORCE;
+    player.onGround = false;
   }
   if(e.code === 'Escape' && isPlaying) {
     document.exitPointerLock();
   }
 }
-function onKeyUp(e) { keys[e.code] = false; }
+
+function onKeyUp(e) {
+  keys[e.code] = false;
+}
 
 function onMouseMove(e) {
   if(!isPlaying || !document.pointerLockElement) return;
   const sens = 0.002;
   player.yaw -= e.movementX * sens;
   player.pitch -= e.movementY * sens;
-  player.pitch = Math.max(-Math.PI/2+0.05, Math.min(Math.PI/2-0.05, player.pitch));
-  camera.rotation.set(player.pitch, player.yaw, 0);
+  player.pitch = Math.max(-Math.PI/2 + 0.05, Math.min(Math.PI/2 - 0.05, player.pitch));
 }
 
 function onLockChange() {
@@ -402,7 +428,7 @@ function onLockChange() {
 }
 
 function onResize() {
-  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 }
@@ -418,9 +444,47 @@ function updateHotbarUI() {
   }
 }
 
-// ========== メインループ ==========
+// ========== 初期化・ループ ==========
+function init(seedValue) {
+  const seed = parseInt(seedValue) || Date.now();
+  noise = new Simplex2D(seed);
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x87CEEB);
+  scene.fog = new THREE.Fog(0x87CEEB, 8, CHUNK_SIZE*RENDER_DISTANCE);
+
+  camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 200);
+  camera.rotation.order = 'YXZ';
+
+  renderer = new THREE.WebGLRenderer({antialias: false});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.2));
+  document.body.appendChild(renderer.domElement);
+
+  // 照明
+  const sun = new THREE.DirectionalLight(0xffffee, 1.3);
+  sun.position.set(30, 60, 30);
+  scene.add(sun);
+  scene.add(new THREE.AmbientLight(0x99aacc, 0.5));
+
+  // プレイヤー初期位置
+  const startSurfaceY = getHeightValue(0, 0);
+  player.y = startSurfaceY + 3;
+
+  updateHotbarUI();
+
+  // イベント登録
+  window.addEventListener('resize', onResize);
+  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keyup', onKeyUp);
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('pointerlockchange', onLockChange);
+
+  requestAnimationFrame(loop);
+}
+
 function loop(now) {
-  const dt = Math.min((now - lastTime)/1000, 0.05);
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
   lastTime = now;
 
   if(isPlaying && document.pointerLockElement) {
@@ -431,23 +495,6 @@ function loop(now) {
   renderer.render(scene, camera);
 
   // FPS表示
-  frameCount++;
-  setTimeout(()=>{
-    fps = frameCount; frameCount=0;
-    document.getElementById('fps').textContent = `FPS: ${fps}`;
-  }, 1000);
-
-  requestAnimationFrame(loop);
-}
-
-// ========== 開始ボタン ==========
-document.getElementById('startBtn').addEventListener('click', async ()=>{
-  const seed = document.getElementById('seedInput').value.trim() || String(Date.now());
-  document.getElementById('startScreen').style.display = 'none';
-  if(!scene) init(seed);
-  await renderer.domElement.requestPointerLock();
-});
-
-</script>
-</body>
-</html>
+  fpsCount++;
+  if(now % 1000 < 50) {
+    fps
