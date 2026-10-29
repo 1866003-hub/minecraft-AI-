@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ブラウザサンドボックス</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;user-select:none;}
+html,body{width:100%;height:100%;overflow:hidden;background:#87CEEB;}
+canvas{display:block;width:100%;height:100%;}
+#ui{position:fixed;inset:0;pointer-events:none;z-index:10;}
+#title-screen{position:absolute;inset:0;background:linear-gradient(#1a237e,#4a148c);display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;pointer-events:auto;}
+#title-screen h1{font-size:2.5rem;margin-bottom:0.5rem;}
+#title-screen p{opacity:0.8;margin-bottom:2rem;}
+.btn{padding:0.8rem 2rem;font-size:1.2rem;background:#4CAF50;border:none;border-radius:8px;color:#fff;cursor:pointer;margin:0.5rem;transition:0.2s;}
+.btn:hover{background:#45a049;transform:scale(1.05);}
+.hotbar{position:absolute;bottom:1rem;left:50%;transform:translateX(-50%);display:flex;gap:4px;}
+.slot{width:48px;height:48px;border:2px solid rgba(255,255,255,0.5);border-radius:4px;background:rgba(0,0,0,0.4);display:flex;align-items:center;justify-content:center;color:#fff;font-size:0.7rem;text-align:center;}
+.slot.active{border-color:#ffd700;background:rgba(255,215,0,0.3);}
+.crosshair{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:20px;height:20px;}
+.crosshair::before,.crosshair::after{content:'';position:absolute;background:rgba(255,255,255,0.8);}
+.crosshair::before{width:2px;height:10px;left:50%;top:50%;transform:translate(-50%,-50%);}
+.crosshair::after{width:10px;height:2px;left:50%;top:50%;transform:translate(-50%,-50%);}
+#status{position:absolute;top:10px;left:10px;color:#fff;text-shadow:0 0 3px #000;}
+#pause-menu{position:absolute;inset:0;background:rgba(0,0,0,0.7);display:none;flex-direction:column;align-items:center;justify-content:center;pointer-events:auto;}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="title-screen">
+    <h1>🌍 ブラウザサンドボックス</h1>
+    <p>Minecraft風 3Dサンドボックスゲーム</p>
+    <button class="btn" id="start-btn">▶ 新規ワールド</button>
+    <button class="btn" id="load-btn">💾 続きから</button>
+    <p style="margin-top:2rem;font-size:0.9rem;opacity:0.7;">
+      操作方法：WASD=移動 / スペース=ジャンプ / Shift=しゃがむ<br>
+      左クリック=破壊 / 右クリック=設置 / 1-9=ブロック選択 / Esc=ポーズ
+    </p>
+  </div>
+  <div id="pause-menu">
+    <h2 style="color:#fff;margin-bottom:2rem;">ポーズ</h2>
+    <button class="btn" id="resume-btn">▶ 再開</button>
+    <button class="btn" id="save-btn">💾 保存して終了</button>
+  </div>
+  <div class="crosshair" id="crosshair" style="display:none;"></div>
+  <div class="hotbar" id="hotbar"></div>
+  <div id="status" style="display:none;">
+    <div>FPS: <span id="fps">60</span></div>
+    <div>位置: <span id="pos">0, 0, 0</span></div>
+    <div>時刻: <span id="time">昼</span></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+// ========== 定数 ==========
+const BLOCK_SIZE = 1;
+const CHUNK_SIZE = 16;
+const RENDER_DISTANCE = 3;
+const SEED = Math.random() * 10000 | 0;
+
+// ブロック定義
+const BLOCKS = {
+  0: {name:'空', solid:false, color:null},
+  1: {name:'草', solid:true, color:'#4CAF50'},
+  2: {name:'土', solid:true, color:'#8D6E63'},
+  3: {name:'石', solid:true, color:'#757575'},
+  4: {name:'丸石', solid:true, color:'#616161'},
+  5: {name:'砂', solid:true, color:'#FDD835'},
+  6: {name:'原木', solid:true, color:'#8D4E2A'},
+  7: {name:'葉', solid:true, color:'#2E7D32', transparent:true},
+  8: {name:'ガラス', solid:true, color:'#BBDEFB', transparent:true},
+  9: {name:'水', solid:false, color:'#2196F3', transparent:true, liquid:true},
+  10: {name:'岩盤', solid:true, color:'#212121', indestructible:true},
+};
+
+const HOTBAR_SLOTS = [1,2,3,4,5,6,7,8,9];
+let selectedSlot = 0;
+
+// ========== 状態管理 ==========
+let scene, camera, renderer, world = {}, player = {};
+let keys = {}, mouse = {x:0,y:0,down:false,rightDown:false};
+let isPlaying = false, isPaused = false;
+let lastTime = performance.now(), frameCount = 0, fps = 60;
+let dayTime = 0; // 0～1=0～24時間
+
+// ========== ユーティリティ ==========
+function noise(x,y,seed=SEED){
+  const hash = (x*12345 + y*67890 + seed) % 65536;
+  return Math.sin(hash*0.00015) * 0.5 + 0.5;
+}
+function smoothNoise(x,y,scale=8){
+  let val=0, amp=1, freq=1, max=0;
+  for(let i=0;i<4;i++){
+    val += noise(Math.floor(x/freq), Math.floor(y/freq)) * amp;
+    max += amp; amp *= 0.5; freq *= scale/2;
+  }
+  return val/max;
+}
+function worldHeight(x,z){
+  const h = smoothNoise(x/32, z/32)*12 + smoothNoise(x/96, z/96)*6;
+  return Math.floor(h + 8);
+}
+
+// ========== チャンク生成 ==========
+class Chunk {
+  constructor(cx,cz){
+    this.cx = cx; this.cz = cz;
+    this.blocks = new Uint8Array(CHUNK_SIZE*CHUNK_SIZE*64); // y:0～63
+    this.mesh = null;
+    this.dirty = true;
+    this.generate();
+  }
+  idx(x,y,z){return y*CHUNK_SIZE*CHUNK_SIZE + z*CHUNK_SIZE + x;}
+  generate(){
+    const ox = this.cx*CHUNK_SIZE;
+    const oz = this.cz*CHUNK_SIZE;
+    for(let x=0;x<CHUNK_SIZE;x++){
+      for(let z=0;z<CHUNK_SIZE;z++){
+        const wx = ox+x, wz = oz+z;
+        const h = worldHeight(wx,wz);
+        for(let y=0;y<64;y++){
+          const i = this.idx(x,y,z);
+          if(y===0){this.blocks[i]=10; continue;}
+          if(y<h-3) this.blocks[i]=3;
+          else if(y<h-1) this.blocks[i]=2;
+          else if(y===h-1) this.blocks[i]=1;
+          else this.blocks[i]=0;
+        }
+        // 木を生やす
+        if(Math.random()<0.02){
+          const th = worldHeight(wx,wz);
+          for(let ty=th;ty<th+4;ty++) this.setBlock(x,ty,z,6);
+          for(let ly=th+4;ly<th+6;ly++){
+            for(let lx=-1;lx<=1;lx++)for(let lz=-1;lz<=1;lz++){
+              if(x+lx>=0&&x+lx<CHUNK_SIZE&&z+lz>=0&&z+lz<CHUNK_SIZE)
+                if(Math.random()<0.8) this.setBlock(x+lx,ly,z+lz,7);
+            }
+          }
+        }
+      }
+    }
+  }
+  getBlock(x,y,z){
+    if(x<0||x>=CHUNK_SIZE||y<0||y>=64||z<0||z>=CHUNK_SIZE) return null;
+    return this.blocks[this.idx(x,y,z)];
+  }
+  setBlock(x,y,z,id){
+    if(x<0||x>=CHUNK_SIZE||y<0||y>=64||z<0||z>=CHUNK_SIZE) return;
+    this.blocks[this.idx(x,y,z)] = id;
+    this.dirty = true;
+  }
+  buildMesh(){
+    if(!this.dirty && this.mesh) return;
+    this.dirty = false;
+    if(this.mesh) scene.remove(this.mesh);
+    const ox = this.cx*CHUNK_SIZE, oz = this.cz*CHUNK_SIZE;
+    const geom = new THREE.BufferGeometry();
+    const pos=[], col=[];
+    const dirs = [
+      [0,1,0, 0,1,0], // 上
+      [0,-1,0, 0,-1,0], // 下
+      [1,0,0, 1,0,0], // 右
+      [-1,0,0, -1,0,0], // 左
+      [0,0,1, 0,0,1], // 前
+      [0,0,-1, 0,0,-1], // 後
+    ];
+    for(let x=0;x<CHUNK_SIZE;x++)for(let y=0;y<64;y++)for(let z=0;z<CHUNK_SIZE;z++){
+      const id = this.getBlock(x,y,z);
+      if(!id || !BLOCKS[id].solid) continue;
+      const c = new THREE.Color(BLOCKS[id].color);
+      for(const [dx,dy,dz,nx,ny,nz] of dirs){
+        const nb = this.getBlock(x+dx,y+dy,z+dz);
+        if(nb && (!BLOCKS[nb].transparent && BLOCKS[nb].solid)) continue;
+        // 面を追加
+        const px=ox+x, py=y, pz=oz+z;
+        const verts = [
+          [px+(nx+1)/2, py+(ny+1)/2, pz+(nz+1)/2],
+          [px+(1+nx+dz-nz)/2, py+(1+ny+dx-dx)/2, pz+(1+nz+dx-dx)/2],
+          [px+(1+nx+dz+nz)/2, py+(1+ny+dy-dy)/2, pz+(1+nz-dx+dx)/2],
+          [px+(nx-dz+nz)/2, py+(ny+dy+dy)/2, pz+(nz+dx+dx)/2],
+        ];
+        const idx = [0,1,2,0,2,3];
+        for(const vi of idx){
+          pos.push(verts[vi][0], verts[vi][1], verts[vi][2]);
+          col.push(c.r,c.g,c.b);
+        }
+      }
+    }
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+    geom.setAttribute('color', new THREE.Float32BufferAttribute(col,3));
+    geom.computeVertexNormals();
+    const mat = new THREE.MeshLambertMaterial({vertexColors:true, side:THREE.DoubleSide});
+    this.mesh = new THREE.Mesh(geom,mat);
+    scene.add(this.mesh);
+  }
+}
+
+// ========== ワールドAPI ==========
+function getChunk(cx,cz){
+  const key = `${cx},${cz}`;
+  if(!world[key]) world[key] = new Chunk(cx,cz);
+  return world[key];
+}
+function getBlockByPos(x,y,z){
+  if(y<0||y>=64) return y<0?10:0;
+  const cx = Math.floor(x/CHUNK_SIZE);
+  const cz = Math.floor(z/CHUNK_SIZE);
+  const chunk = getChunk(cx,cz);
+  const lx = Math.floor(x - cx*CHUNK_SIZE);
+  const lz = Math.floor(z - cz*CHUNK_SIZE);
+  return chunk.getBlock(lx,Math.floor(y),lz) || 0;
+}
+function setBlockByPos(x,y,z,id){
+  if(y<1||y>=64) return;
+  const cx = Math.floor(x/CHUNK_SIZE);
+  const cz = Math.floor(z/CHUNK_SIZE);
+  const chunk = getChunk(cx,cz);
+  const lx = Math.floor(x - cx*CHUNK_SIZE);
+  const lz = Math.floor(z - cz*CHUNK_SIZE);
+  chunk.setBlock(lx,Math.floor(y),lz,id);
+}
+
+// ========== プレイヤー ==========
+function initPlayer(){
+  player = {
+    x:CHUNK_SIZE*RENDER_DISTANCE, y:20, z:CHUNK_SIZE*RENDER_DISTANCE,
+    vx:0, vy:0, vz:0,
+    yaw:0, pitch:0,
+    width:0.6, height:1.8,
+    onGround:false, health:20, hunger:20,
+    crouching:false, sprinting:false
+  };
+  // 適切な高さに
+  const h = worldHeight(player.x,player.z);
+  player.y = h+2;
+}
+
+function checkCollision(x,y,z,w,h,d){
+  const steps = 0.2;
+  for(let dx=-w/2;dx<=w/2;dx+=steps){
+    for(let dz=-d/2;dz<=d/2;dz+=steps){
+      for(let dy=0;dy<=h;dy+=steps){
+        const id = getBlockByPos(x+dx, y+dy, z+dz);
+        if(BLOCKS[id] && BLOCKS[id].solid) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function raycast(maxDist=6){
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  let x=player.x, y=player.y+1.6, z=player.z;
+  let prev = {x,y,z};
+  for(let d=0;d<maxDist;d+=0.1){
+    x += dir.x*0.1; y += dir.y*0.1; z += dir.z*0.1;
+    const id = getBlockByPos(x,y,z);
+    if(BLOCKS[id] && BLOCKS[id].solid){
+      return {hit:true, x,y,z, nx:Math.round(x), ny:Math.round(y), nz:Math.round(z), prev};
+    }
+    prev = {x,y,z};
+  }
+  return {hit:false};
+}
+
+// ========== 入力 ==========
+function setupInput(){
+  document.addEventListener('keydown',e=>{
+    keys[e.code]=true;
+    if(e.code==='Escape' && isPlaying){
+      isPaused = !isPaused;
+      document.exitPointerLock();
+      document.getElementById('pause-menu').style.display = isPaused?'flex':'none';
+    }
+    if(e.code.startsWith('Digit')){
+      const n = parseInt(e.code.replace('Digit',''))-1;
+      if(n>=0&&n<9) selectedSlot = n;
+      updateHotbar();
+    }
+  });
+  document.addEventListener('keyup',e=>keys[e.code]=false);
+  document.addEventListener('mousemove',e=>{
+    if(!document.pointerLockElement || isPaused) return;
+    player.yaw -= e.movementX*0.002;
+    player.pitch -= e.movementY*0.002;
+    player.pitch = Math.max(-Math.PI/2+0.01, Math.min(Math.PI/2-0.01, player.pitch));
+  });
+  document.addEventListener('mousedown',e=>{
+    if(!isPlaying || isPaused) return;
+    if(e.button===0) mineBlock();
+    if(e.button===2) placeBlock();
+  });
+  document.addEventListener('contextmenu',e=>e.preventDefault());
+}
+
+function mineBlock(){
+  const r = raycast();
+  if(!r.hit) return;
+  const id = getBlockByPos(r.nx, r.ny, r.nz);
+  if(BLOCKS[id].indestructible) return;
+  setBlockByPos(r.nx, r.ny, r.nz, 0);
+}
+function placeBlock(){
+  const r = raycast();
+  if(!r.hit) return;
+  const bx = Math.round(r.prev.x), by = Math.round(r.prev.y), bz = Math.round(r.prev.z);
+  if(checkCollision(bx+0.5, by, bz+0.5, player.width, player.height, player.width)) return;
+  setBlockByPos(bx, by, bz, HOTBAR_SLOTS[selectedSlot]);
+}
+
+function updateHotbar(){
+  const bar = document.getElementById('hotbar');
+  bar.innerHTML = '';
+  for(let i=0;i<9;i++){
+    const s = document.createElement('div');
+    s.className = `slot ${i===selectedSlot?'active':''}`;
+    s.style.background = BLOCKS[HOTBAR_SLOTS[i]].color;
+    s.textContent = i+1;
+    bar.appendChild(s);
+  }
+}
+
+// ========== ゲームループ ==========
+function update(dt){
+  if(isPaused) return;
+  // 移動ベクトル
+  const spd = player.crouching?3:player.sprinting?8:5;
+  let dx=0, dz=0;
+  if(keys['KeyW']) dz-=1; if(keys['KeyS']) dz+=1;
+  if(keys['KeyA']) dx-=1; if(keys['KeyD']) dx+=1;
+  if(keys['ShiftLeft']) player.crouching=true; else player.crouching=false;
+  if(keys['Space'] && player.onGround) player.vy=6;
+
+  // 方向変換
+  const cos = Math.cos(player.yaw), sin = Math.sin(player.yaw);
+  const mx = dx*cos - dz*sin;
+  const mz = dz*cos + dx*sin;
+  const len = Math.hypot(mx,mz)||1;
+
+  // 衝突判定しながら移動
+  const nx = player.x + (mx/len)*spd*dt;
+  if(!checkCollision(nx, player.y, player.z, player.width, player.height, player.width)) player.x = nx;
+  const nz = player.z + (mz/len)*spd*dt;
+  if(!checkCollision(player.x, player.y, nz, player.width, player.height, player.width)) player.z = nz;
+
+  // 重力
+  player.vy -= 20*dt;
+  const ny = player.y + player.vy*dt;
+  if(checkCollision(player.x, ny, player.z, player.width, player.height, player.width)){
+    if(player.vy<0){
+      player.onGround = true;
+      player.vy = 0;
+      // 落下ダメージ
+      if(player.y - ny > 3) player.health -= Math.floor(player.y - ny - 3);
+    } else {
+      player.vy = 0;
+    }
+  } else {
+    player.y = ny;
+    player.onGround = false;
+  }
+
+  // カメラ
+  camera.rotation.order = 'YXZ';
+  camera.rotation.y = player.yaw;
+  camera.rotation.x = player.pitch;
+  camera.position.set(player.x, player.y+1.6, player.z);
+
+  // 昼夜
+  dayTime = (dayTime + dt*0.01) % 1;
+  const sunAngle = dayTime*Math.PI*2 - Math.PI/2;
+  const sunDir = new THREE.Vector3(Math.cos(sunAngle), Math.sin(sunAngle), 0).normalize();
+  scene.children.find(c=>c.isDirectionalLight)?.position.set(sunDir.x*50, sunDir.y*50+20, sunDir.z*50);
+  const bright = Math.max(0.1, Math.sin(sunAngle)*0.7+0.3);
+  renderer.setClearColor(new THREE.Color(bright*0.5, bright*0.7, bright), 1);
+
+  // チャンク読込
+  const pcx = Math.floor(player.x/CHUNK_SIZE);
+  const pcz = Math.floor(player.z/CHUNK_SIZE);
+  for(let cx=pcx-RENDER_DISTANCE;cx<=pcx+RENDER_DISTANCE;cx++){
+    for(let cz=pcz-RENDER_DISTANCE;cz<=pcz+RENDER_DISTANCE;cz++){
+      getChunk(cx,cz).buildMesh();
+    }
+  }
+  // 遠いチャンク削除
+  for(const key in world){
+    const [cx,cz] = key.split(',').map(Number);
+    if(Math.hypot(cx-pcx, cz-pcz) > RENDER_DISTANCE+1){
+      if(world[key].mesh) scene.remove(world[key].mesh);
+      delete world[key];
+    }
+  }
+
+  // UI更新
+  document.getElementById('pos').textContent = `${player.x.toFixed(1)}, ${player.y.toFixed(1)}, ${player.z.toFixed(1)}`;
+  document.getElementById('time').textContent = dayTime<0.25||dayTime>0.8?'🌙 夜':'☀️ 昼';
+}
+
+function loop(t){
+  frameCount++;
+  if(t-lastTime>=1000){
+    fps = frameCount; frameCount =
